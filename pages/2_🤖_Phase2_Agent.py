@@ -99,6 +99,10 @@ class PerceptionAgent:
         if metrics.get("is_inverted"):
             log.append("🔄 **Dark background detected** (light text on dark bg) → image will be inverted before OCR")
 
+        if metrics.get("has_ruled_lines"):
+            log.append(f"📓 **Colored notebook paper detected** (saturation={metrics.get('sat_mean',0):.1f}) → "
+                       "blue ruled lines will be removed, min-channel decomposition applied to preserve colored ink")
+
         if metrics["is_handwritten"]:
             log.append("✏️ Document type: **Handwritten** (edge ratio low → likely notes)")
         else:

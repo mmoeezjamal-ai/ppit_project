@@ -61,42 +61,92 @@ def get_skew_angle(gray: np.ndarray) -> float:
         return 0.0
 
 
+def _remove_ruled_lines(img_rgb: np.ndarray) -> np.ndarray:
+    """
+    Remove blue/colored ruled notebook lines using HSV masking.
+    Returns a cleaned grayscale using the minimum-channel trick so that
+    ALL colored ink (red, blue, green) becomes as dark as black ink.
+    """
+    hsv = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV)
+    hue, sat, val = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+
+    # Blue ruled-line mask: H≈100-130 in OpenCV (blue), moderate saturation
+    blue_mask = ((hue > 88) & (hue < 138) & (sat > 25) & (val > 80)).astype(np.uint8)
+    # Horizontal dilation — fills gaps along horizontal line strokes
+    h_kern    = np.ones((1, 30), np.uint8)
+    blue_mask = cv2.dilate(blue_mask, h_kern)
+
+    # Minimum-channel trick: min(R,G,B) per pixel
+    #   Any saturated color (red, green, blue) has at least one very LOW channel
+    #   → min() picks that low value → colored text appears DARK (good for OCR)
+    #   White bg: min(240,240,240)=240 (bright)   Black text: min(50,50,50)=50 (dark)
+    #   Red text:  min(200,55,55)=55 (dark ✓)     Blue lines: we blank with mask
+    gray_min = np.min(img_rgb, axis=2).astype(np.uint8)
+
+    # Blank out detected ruled lines → replace with white
+    gray_min[blue_mask > 0] = 255
+
+    # Also erase long horizontal runs via morphology (catches non-blue faint lines)
+    line_kern = cv2.getStructuringElement(cv2.MORPH_RECT, (60, 1))
+    h_lines   = cv2.morphologyEx(gray_min, cv2.MORPH_OPEN, line_kern)
+    # Only erase where the line is bright enough to be background
+    gray_min[h_lines > 200] = 255
+
+    return gray_min
+
+
 def preprocess_image(pil_img: Image.Image, strategy: str = "enhanced") -> Image.Image:
     """
     strategy: 'basic' | 'enhanced' | 'aggressive'
-    Handles both normal (dark text on white bg) and inverted (light text on dark bg).
+    Full pipeline:
+      1. Upscale to ≥1400px wide
+      2. Invert if dark-background (UI screenshots, dark-mode docs)
+      3. Remove colored ruled lines (notebook paper) via HSV + min-channel
+      4. Denoise → CLAHE → sharpen → adaptive threshold → deskew → morph-close
     """
     w, h = pil_img.size
     if w < 1400:
         scale = 1400 / w
         pil_img = pil_img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
 
-    img  = np.array(pil_img.convert("RGB"))
-    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    img_rgb = np.array(pil_img.convert("RGB"))
 
-    # ── Critical fix: invert dark-background images (light text on dark bg) ──
-    if np.mean(gray) < 110:
-        gray = cv2.bitwise_not(gray)
+    # ── Step 1: Invert dark-background images (UI, dark-mode screenshots) ──────
+    gray_check = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
+    if np.mean(gray_check) < 110:
+        img_rgb   = cv2.bitwise_not(img_rgb)
+
+    # ── Step 2: Smart grayscale with colored-line removal ──────────────────────
+    # Detect if image has colored ruled lines (notebook paper)
+    hsv_check = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV)
+    sat_mean  = float(np.mean(hsv_check[:, :, 1]))
+    has_color = sat_mean > 18  # colored ink or ruled lines present
+
+    if has_color:
+        gray = _remove_ruled_lines(img_rgb)
+    else:
+        gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
 
     if strategy == "basic":
         binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
         return Image.fromarray(binary)
 
     if strategy in ("enhanced", "aggressive"):
-        h_val = 12 if strategy == "enhanced" else 20
-        gray = cv2.fastNlMeansDenoising(gray, h=h_val, templateWindowSize=7, searchWindowSize=21)
-        clahe = cv2.createCLAHE(clipLimit=3.0 if strategy == "enhanced" else 4.0,
-                                 tileGridSize=(8, 8))
-        gray = clahe.apply(gray)
+        h_val = 10 if strategy == "enhanced" else 16
+        gray  = cv2.fastNlMeansDenoising(gray, h=h_val, templateWindowSize=7,
+                                          searchWindowSize=21)
+        clahe = cv2.createCLAHE(clipLimit=3.5 if strategy == "enhanced" else 4.5,
+                                  tileGridSize=(8, 8))
+        gray  = clahe.apply(gray)
 
         if strategy == "aggressive":
             kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]], dtype=np.float32)
             gray   = np.clip(cv2.filter2D(gray, -1, kernel), 0, 255).astype(np.uint8)
 
-        block = 19 if strategy == "enhanced" else 25
+        block  = 19 if strategy == "enhanced" else 25
         binary = cv2.adaptiveThreshold(gray, 255,
                                         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                        cv2.THRESH_BINARY, block, 9)
+                                        cv2.THRESH_BINARY, block, 8)
         binary = deskew(binary)
         k      = np.ones((2, 2), np.uint8)
         binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, k)
@@ -111,17 +161,28 @@ def preprocess_image(pil_img: Image.Image, strategy: str = "enhanced") -> Image.
 
 def analyze_image_quality(pil_img: Image.Image) -> dict:
     """Return quality metrics used by the Perception Agent."""
-    img  = np.array(pil_img.convert("RGB"))
-    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    img_rgb = np.array(pil_img.convert("RGB"))
 
-    brightness    = float(np.mean(gray))
-    is_inverted   = brightness < 110  # light text on dark background
+    # Invert dark-background images before analysis
+    gray_raw   = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
+    is_inverted = float(np.mean(gray_raw)) < 110
     if is_inverted:
-        gray_for_analysis = cv2.bitwise_not(gray)
+        img_rgb = cv2.bitwise_not(img_rgb)
+
+    # Detect colored image (notebook paper, colored ink)
+    hsv_check = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV)
+    sat_mean  = float(np.mean(hsv_check[:, :, 1]))
+    has_color = sat_mean > 18
+    has_ruled_lines = has_color  # same heuristic
+
+    # Use cleaned grayscale for all metrics
+    if has_color:
+        gray_for_analysis = _remove_ruled_lines(img_rgb)
     else:
-        gray_for_analysis = gray
-    brightness    = float(np.mean(gray_for_analysis))
-    contrast      = float(np.std(gray_for_analysis))
+        gray_for_analysis = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
+
+    brightness = float(np.mean(gray_for_analysis))
+    contrast   = float(np.std(gray_for_analysis))
 
     lap_var = float(cv2.Laplacian(gray_for_analysis, cv2.CV_64F).var())
     sharpness = min(lap_var / 20.0, 100.0)
@@ -157,7 +218,9 @@ def analyze_image_quality(pil_img: Image.Image) -> dict:
         "is_multi_column":is_multi_col,
         "quality_score":  quality_score,
         "edge_ratio":     edge_ratio,
-        "is_inverted":    is_inverted,
+        "is_inverted":      is_inverted,
+        "has_ruled_lines":  has_ruled_lines,
+        "sat_mean":         sat_mean,
     }
 
 
