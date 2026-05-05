@@ -273,7 +273,13 @@ class DocumentAgent:
 
     def run(self, paras: list, title: str) -> dict:
         ts  = time.time()
-        doc = generate_docx([paras], title)
+        # paras is already list[list[dict]] — wrap in one more list for multi-page support
+        # but only if the inner items are lists (Tesseract/EasyOCR both produce list[list[dict]])
+        if paras and isinstance(paras[0], list):
+            all_pages = [paras]   # single page: [[ [line,...], [line,...], ... ]]
+        else:
+            all_pages = [[paras]] # fallback: wrap flat list
+        doc = generate_docx(all_pages, title)
         buf = io.BytesIO()
         doc.save(buf)
         buf.seek(0)
@@ -548,14 +554,14 @@ with col_pipe:
             if ocr_result["engine"] == "easyocr" and ocr_result["easy_results"]:
                 easy_paras = easyocr_to_paragraphs(ocr_result["easy_results"], page_w)
                 fmt_result = {
-                    "paragraphs": easy_paras,
-                    "headings":   sum(1 for p in easy_paras if p["is_heading"]),
-                    "bullets":    sum(1 for p in easy_paras if p["is_bullet"]),
-                    "log":        [f"📝 EasyOCR: {len(easy_paras)} text regions formatted",
-                                   f"🔖 {sum(1 for p in easy_paras if p['is_heading'])} headings detected",
-                                   f"• {sum(1 for p in easy_paras if p['is_bullet'])} bullets detected"],
-                    "lines":      [{"clean": p["text"], "reason": f"EasyOCR region — {'Heading' if p['is_heading'] else 'Bullet' if p['is_bullet'] else 'Body'}"}
-                                   for p in easy_paras],
+                    "paras":    easy_paras,
+                    "headings": sum(1 for p in easy_paras if p and p[0]["is_heading"]),
+                    "bullets":  sum(1 for p in easy_paras if p and p[0]["is_bullet"]),
+                    "log":      [f"📝 EasyOCR: {len(easy_paras)} text regions formatted",
+                                 f"🔖 {sum(1 for p in easy_paras if p and p[0]['is_heading'])} headings detected",
+                                 f"• {sum(1 for p in easy_paras if p and p[0]['is_bullet'])} bullets detected"],
+                    "lines":      [{"clean": p[0]["clean"], "reason": f"EasyOCR region — {'Heading' if p[0]['is_heading'] else 'Bullet' if p[0]['is_bullet'] else 'Body'}"}
+                                   for p in easy_paras if p],
                     "duration":   0,
                 }
             else:

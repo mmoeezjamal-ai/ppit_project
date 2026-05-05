@@ -302,47 +302,47 @@ def run_easyocr(pil_img: Image.Image) -> list | None:
 
 def easyocr_to_paragraphs(results: list, page_w: int) -> list:
     """
-    Convert EasyOCR result list → list of paragraph dicts compatible with
-    generate_docx().  Each dict has keys:
-      text, is_heading, heading_level, is_bullet, alignment, is_bold
+    Convert EasyOCR result list → list[list[dict]] compatible with generate_docx().
+    Structure: paragraphs (outer list) → lines in paragraph (inner list).
+    Each line dict uses the same keys as extract_formatted_lines/group_into_paragraphs:
+      clean, is_heading, h_level, is_bullet, alignment, is_bold
     """
     if not results:
         return []
 
-    paragraphs = []
+    all_paras = []
     img_h_approx = max(r[0][2][1] for r in results) if results else 1
 
     for bbox, text, conf in results:
         text = text.strip()
-        if not text or conf < 0.15:        # skip very low-confidence detections
+        if not text or conf < 0.15:
             continue
 
         tl, tr, br, bl = bbox
         x_left  = int(tl[0])
         y_top   = int(tl[1])
-        width   = int(tr[0] - tl[0])
-        height  = int(abs(br[1] - tl[1]))
+        width   = int(max(tr[0] - tl[0], 1))
+        height  = int(max(abs(br[1] - tl[1]), 1))
 
-        # ── Formatting heuristics ──────────────────────────────────────────────
-        # Heading: ALL CAPS, starts with #, or very tall text
+        # ── Heading detection ──────────────────────────────────────────────────
+        clean = re.sub(r"^#+\s*", "", text).strip()
         is_heading = (
             text.startswith("#") or
             (text.isupper() and 2 <= len(text.split()) <= 8) or
-            (height > 0 and height > 40)   # large text = heading in notes
+            height > 40
         )
-        clean = re.sub(r"^#+\s*", "", text).strip()
+        h_level = 1 if (y_top / img_h_approx < 0.15 and is_heading) else 2
 
-        # Heading level: top 15% of page → H1, otherwise H2
-        heading_level = 1 if (y_top / img_h_approx < 0.15 and is_heading) else 2
-
-        # Bullet detection
+        # ── Bullet detection ───────────────────────────────────────────────────
         is_bullet = bool(re.match(
             r"^([•·●○◦▪▫\-–—\*]|\d{1,2}[.)]\s|[a-zA-Z][.)]\s)", clean
         ))
         if is_bullet:
-            clean = re.sub(r"^([•·●○◦▪▫\-–—\*]|\d{1,2}[.)]\s|[a-zA-Z][.)]\s)", "", clean).strip()
+            clean = re.sub(
+                r"^([•·●○◦▪▫\-–—\*]|\d{1,2}[.)]\s|[a-zA-Z][.)]\s)", "", clean
+            ).strip()
 
-        # Alignment (center / right / left)
+        # ── Alignment ─────────────────────────────────────────────────────────
         cx = x_left + width / 2
         if page_w > 0 and abs(cx - page_w / 2) < page_w * 0.12:
             alignment = "center"
@@ -351,19 +351,19 @@ def easyocr_to_paragraphs(results: list, page_w: int) -> list:
         else:
             alignment = "left"
 
-        # Bold: confident heading or very tall characters
-        is_bold = is_heading or (height > 35)
+        is_bold = is_heading or height > 35
 
-        paragraphs.append({
-            "text":          clean,
-            "is_heading":    is_heading,
-            "heading_level": heading_level,
-            "is_bullet":     is_bullet,
-            "alignment":     alignment,
-            "is_bold":       is_bold,
-        })
+        # Each EasyOCR region = one paragraph containing one line (list[dict])
+        all_paras.append([{
+            "clean":      clean,
+            "is_heading": is_heading,
+            "h_level":    h_level,
+            "is_bullet":  is_bullet,
+            "alignment":  alignment,
+            "is_bold":    is_bold,
+        }])
 
-    return paragraphs
+    return all_paras
 
 
 # ══════════════════════════════════════════════════════════════════════════════
