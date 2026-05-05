@@ -8,7 +8,7 @@ from PIL import Image
 import numpy as np
 
 from utils import (analyze_image_quality, recommend_strategy, preprocess_image,
-                   run_ocr, extract_formatted_lines, group_into_paragraphs,
+                   run_ocr, run_ocr_best, extract_formatted_lines, group_into_paragraphs,
                    generate_docx, classify_line, detect_alignment)
 
 st.set_page_config(page_title="Phase 2 — Agentic", page_icon="🤖", layout="wide")
@@ -96,6 +96,9 @@ class PerceptionAgent:
         log.append(f"📊 Quality score: {metrics['quality_score']:.1f}/100")
         log.append(f"💡 Recommended strategy: **{rec_strategy}** — {rec_reason}")
 
+        if metrics.get("is_inverted"):
+            log.append("🔄 **Dark background detected** (light text on dark bg) → image will be inverted before OCR")
+
         if metrics["is_handwritten"]:
             log.append("✏️ Document type: **Handwritten** (edge ratio low → likely notes)")
         else:
@@ -133,14 +136,14 @@ class PerceptionAgent:
 
 
 class OCRAgent:
-    """Runs OCR and reports results with confidence."""
+    """Runs OCR with automatic PSM selection and reports results with confidence."""
 
     def run(self, preprocessed: Image.Image) -> dict:
         log = []
         ts  = time.time()
-        log.append("⚙️ Running Tesseract OCR (OEM 3, PSM 6)…")
+        log.append("⚙️ Testing PSM modes: 6 (block), 4 (column), 11 (sparse), 3 (auto)…")
 
-        data = run_ocr(preprocessed, psm=6)
+        data, best_psm, _ = run_ocr_best(preprocessed)
         if data is None:
             return {"data": None, "words": 0, "avg_conf": 0,
                     "log": ["❌ OCR failed"], "duration": 0, "success": False}
@@ -150,6 +153,7 @@ class OCRAgent:
         confs = [int(c) for c in data["conf"] if int(c) > 0]
         avg_c = round(sum(confs) / len(confs), 1) if confs else 0
 
+        log.append(f"🏆 Best PSM mode: **{best_psm}**")
         log.append(f"📝 Words extracted: **{len(words)}**")
         log.append(f"📊 Average confidence: **{avg_c}%**")
 
@@ -164,6 +168,7 @@ class OCRAgent:
             "data":     data,
             "words":    len(words),
             "avg_conf": avg_c,
+            "psm":      best_psm,
             "log":      log,
             "duration": round(time.time() - ts, 3),
             "success":  True,

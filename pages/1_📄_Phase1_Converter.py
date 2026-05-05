@@ -1,7 +1,7 @@
 import streamlit as st
 import io
 from PIL import Image
-from utils import (preprocess_image, run_ocr, extract_formatted_lines,
+from utils import (preprocess_image, run_ocr_best, extract_formatted_lines,
                    group_into_paragraphs, generate_docx)
 
 st.set_page_config(page_title="Phase 1 — Image→Word", page_icon="📄", layout="wide")
@@ -86,7 +86,7 @@ for idx, f in enumerate(uploaded):
                 st.image(pre, use_container_width=True)
 
         with st.spinner("Running OCR…"):
-            data = run_ocr(pre)
+            data, _psm, _ = run_ocr_best(pre)
 
         if data is None:
             st.error("OCR failed — skipping.")

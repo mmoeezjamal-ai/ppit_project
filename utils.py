@@ -64,6 +64,7 @@ def get_skew_angle(gray: np.ndarray) -> float:
 def preprocess_image(pil_img: Image.Image, strategy: str = "enhanced") -> Image.Image:
     """
     strategy: 'basic' | 'enhanced' | 'aggressive'
+    Handles both normal (dark text on white bg) and inverted (light text on dark bg).
     """
     w, h = pil_img.size
     if w < 1400:
@@ -72,6 +73,10 @@ def preprocess_image(pil_img: Image.Image, strategy: str = "enhanced") -> Image.
 
     img  = np.array(pil_img.convert("RGB"))
     gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+
+    # ── Critical fix: invert dark-background images (light text on dark bg) ──
+    if np.mean(gray) < 110:
+        gray = cv2.bitwise_not(gray)
 
     if strategy == "basic":
         binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
@@ -109,18 +114,24 @@ def analyze_image_quality(pil_img: Image.Image) -> dict:
     img  = np.array(pil_img.convert("RGB"))
     gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
 
-    brightness = float(np.mean(gray))
-    contrast   = float(np.std(gray))
+    brightness    = float(np.mean(gray))
+    is_inverted   = brightness < 110  # light text on dark background
+    if is_inverted:
+        gray_for_analysis = cv2.bitwise_not(gray)
+    else:
+        gray_for_analysis = gray
+    brightness    = float(np.mean(gray_for_analysis))
+    contrast      = float(np.std(gray_for_analysis))
 
-    lap_var = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    lap_var = float(cv2.Laplacian(gray_for_analysis, cv2.CV_64F).var())
     sharpness = min(lap_var / 20.0, 100.0)
 
-    noise = float(np.std(gray - cv2.GaussianBlur(gray, (5, 5), 0)))
+    noise = float(np.std(gray_for_analysis - cv2.GaussianBlur(gray_for_analysis, (5, 5), 0)))
 
-    skew = abs(get_skew_angle(cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]))
+    skew = abs(get_skew_angle(cv2.threshold(gray_for_analysis, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]))
 
     # Handwritten vs printed heuristic
-    edges       = cv2.Canny(gray, 50, 150)
+    edges       = cv2.Canny(gray_for_analysis, 50, 150)
     edge_ratio  = float(np.sum(edges > 0)) / edges.size
     is_handwritten = edge_ratio < 0.08
 
@@ -146,6 +157,7 @@ def analyze_image_quality(pil_img: Image.Image) -> dict:
         "is_multi_column":is_multi_col,
         "quality_score":  quality_score,
         "edge_ratio":     edge_ratio,
+        "is_inverted":    is_inverted,
     }
 
 
@@ -174,8 +186,30 @@ def run_ocr(pil_img: Image.Image, psm: int = 6) -> dict | None:
     try:
         return pytesseract.image_to_data(pil_img, config=config,
                                          output_type=pytesseract.Output.DICT)
-    except Exception as e:
+    except Exception:
         return None
+
+
+def run_ocr_best(pil_img: Image.Image) -> tuple[dict | None, int, float]:
+    """Try multiple PSM modes and return (best_data, best_psm, avg_conf)."""
+    candidates = [6, 4, 11, 3]
+    best_data, best_psm, best_conf = None, 6, 0.0
+    for psm in candidates:
+        data = run_ocr(pil_img, psm=psm)
+        if data is None:
+            continue
+        words = [w.strip() for w, c in zip(data["text"], data["conf"])
+                 if w.strip() and int(c) > 10]
+        confs = [int(c) for c in data["conf"] if int(c) > 0]
+        if not words:
+            continue
+        avg_c = sum(confs) / len(confs) if confs else 0
+        score = len(words) * 0.5 + avg_c * 0.5  # weight both coverage and confidence
+        if score > best_conf:
+            best_conf = score
+            best_data = data
+            best_psm  = psm
+    return best_data, best_psm, best_conf
 
 
 # ══════════════════════════════════════════════════════════════════════════════
