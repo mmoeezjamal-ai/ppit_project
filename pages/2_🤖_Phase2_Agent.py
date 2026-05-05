@@ -8,7 +8,8 @@ from PIL import Image
 import numpy as np
 
 from utils import (analyze_image_quality, recommend_strategy, preprocess_image,
-                   run_ocr, run_ocr_best, extract_formatted_lines, group_into_paragraphs,
+                   run_ocr, run_ocr_best, run_easyocr, easyocr_to_paragraphs,
+                   extract_formatted_lines, group_into_paragraphs,
                    generate_docx, classify_line, detect_alignment)
 
 st.set_page_config(page_title="Phase 2 — Agentic", page_icon="🤖", layout="wide")
@@ -140,42 +141,75 @@ class PerceptionAgent:
 
 
 class OCRAgent:
-    """Runs OCR with automatic PSM selection and reports results with confidence."""
+    """Dual-engine OCR: Tesseract (printed text) or EasyOCR (handwriting)."""
 
-    def run(self, preprocessed: Image.Image) -> dict:
+    def run(self, preprocessed: Image.Image, engine: str = "tesseract",
+            original_img: Image.Image = None) -> dict:
         log = []
         ts  = time.time()
-        log.append("⚙️ Testing PSM modes: 6 (block), 4 (column), 11 (sparse), 3 (auto)…")
 
+        # ── EasyOCR path ──────────────────────────────────────────────────────
+        if engine == "easyocr":
+            log.append("🧠 Using **EasyOCR** (deep learning — better for handwriting)…")
+            log.append("⏳ Loading model on first run (~15 s) — cached for subsequent runs")
+            src = original_img if original_img is not None else preprocessed
+            results = run_easyocr(src)
+            if not results:
+                return {"data": None, "easy_results": None, "words": 0, "avg_conf": 0,
+                        "engine": "easyocr", "log": ["❌ EasyOCR failed — is easyocr installed?"],
+                        "duration": 0, "success": False}
+            words = [r[1].strip() for r in results if r[1].strip() and r[2] > 0.15]
+            avg_c = round(sum(r[2] for r in results) / len(results) * 100, 1)
+            log.append(f"📝 Text regions detected: **{len(results)}**")
+            log.append(f"📝 Words extracted: **{len(words)}**")
+            log.append(f"📊 Average confidence: **{avg_c}%**")
+            if avg_c < 50:
+                log.append("⚠️ Low confidence — very difficult handwriting")
+            elif avg_c < 70:
+                log.append("🟡 Moderate confidence — some words may need correction")
+            else:
+                log.append("✅ Good confidence — EasyOCR handled this well")
+            return {
+                "data":         None,
+                "easy_results": results,
+                "words":        len(words),
+                "avg_conf":     avg_c,
+                "engine":       "easyocr",
+                "log":          log,
+                "duration":     round(time.time() - ts, 3),
+                "success":      True,
+            }
+
+        # ── Tesseract path ────────────────────────────────────────────────────
+        log.append("⚙️ Using **Tesseract** — testing PSM modes: 6, 4, 11, 3…")
         data, best_psm, _ = run_ocr_best(preprocessed)
         if data is None:
-            return {"data": None, "words": 0, "avg_conf": 0,
-                    "log": ["❌ OCR failed"], "duration": 0, "success": False}
-
+            return {"data": None, "easy_results": None, "words": 0, "avg_conf": 0,
+                    "engine": "tesseract", "log": ["❌ Tesseract OCR failed"],
+                    "duration": 0, "success": False}
         words = [w.strip() for w, c in zip(data["text"], data["conf"])
                  if w.strip() and int(c) > 10]
         confs = [int(c) for c in data["conf"] if int(c) > 0]
         avg_c = round(sum(confs) / len(confs), 1) if confs else 0
-
-        log.append(f"🏆 Best PSM mode: **{best_psm}**")
+        log.append(f"🏆 Best PSM: **{best_psm}**")
         log.append(f"📝 Words extracted: **{len(words)}**")
         log.append(f"📊 Average confidence: **{avg_c}%**")
-
         if avg_c < 50:
-            log.append("⚠️ Low confidence — handwritten text or image quality issue")
+            log.append("⚠️ Low confidence — try switching to **EasyOCR** for handwriting")
         elif avg_c < 70:
             log.append("🟡 Moderate confidence — results may need review")
         else:
             log.append("✅ High confidence — OCR reliable")
-
         return {
-            "data":     data,
-            "words":    len(words),
-            "avg_conf": avg_c,
-            "psm":      best_psm,
-            "log":      log,
-            "duration": round(time.time() - ts, 3),
-            "success":  True,
+            "data":         data,
+            "easy_results": None,
+            "words":        len(words),
+            "avg_conf":     avg_c,
+            "psm":          best_psm,
+            "engine":       "tesseract",
+            "log":          log,
+            "duration":     round(time.time() - ts, 3),
+            "success":      True,
         }
 
 
@@ -337,6 +371,16 @@ with st.sidebar:
     st.markdown("### 🕹️ Human-in-the-Loop Controls")
     st.caption("Override agent decisions at any step.")
 
+    ocr_engine = st.radio(
+        "OCR Engine",
+        ["🤖 Tesseract (fast, printed text)", "🧠 EasyOCR (slow, handwriting)"],
+        help="EasyOCR uses deep learning — much better for handwritten notes. First run takes ~15s to load model."
+    )
+    ocr_engine = "easyocr" if "EasyOCR" in ocr_engine else "tesseract"
+
+    if ocr_engine == "easyocr":
+        st.info("EasyOCR runs on the **original image** (no preprocessing needed). First run loads the model (~15 s).")
+
     override_strategy = st.selectbox(
         "Preprocessing strategy",
         ["🤖 Let agent decide", "basic", "enhanced", "aggressive"],
@@ -480,7 +524,9 @@ with col_pipe:
 
         with st.spinner("OCR Agent extracting text…"):
             ocr_agent  = OCRAgent()
-            ocr_result = ocr_agent.run(preprocessed)
+            ocr_result = ocr_agent.run(preprocessed,
+                                       engine=ocr_engine,
+                                       original_img=pil_img)
 
         if not ocr_result["success"]:
             st.error("OCR failed."); st.stop()
@@ -499,10 +545,24 @@ with col_pipe:
         st.markdown('<div class="agent-title">⚖️ Step 4 — Formatting Decision Agent</div>', unsafe_allow_html=True)
 
         with st.spinner("Decision Agent analysing structure…"):
-            fmt_agent  = FormattingDecisionAgent()
-            fmt_result = fmt_agent.run(ocr_result["data"], page_w,
-                                       bold_threshold=bold_thresh,
-                                       heading_threshold=heading_thresh)
+            if ocr_result["engine"] == "easyocr" and ocr_result["easy_results"]:
+                easy_paras = easyocr_to_paragraphs(ocr_result["easy_results"], page_w)
+                fmt_result = {
+                    "paragraphs": easy_paras,
+                    "headings":   sum(1 for p in easy_paras if p["is_heading"]),
+                    "bullets":    sum(1 for p in easy_paras if p["is_bullet"]),
+                    "log":        [f"📝 EasyOCR: {len(easy_paras)} text regions formatted",
+                                   f"🔖 {sum(1 for p in easy_paras if p['is_heading'])} headings detected",
+                                   f"• {sum(1 for p in easy_paras if p['is_bullet'])} bullets detected"],
+                    "lines":      [{"clean": p["text"], "reason": f"EasyOCR region — {'Heading' if p['is_heading'] else 'Bullet' if p['is_bullet'] else 'Body'}"}
+                                   for p in easy_paras],
+                    "duration":   0,
+                }
+            else:
+                fmt_agent  = FormattingDecisionAgent()
+                fmt_result = fmt_agent.run(ocr_result["data"], page_w,
+                                           bold_threshold=bold_thresh,
+                                           heading_threshold=heading_thresh)
 
         for line in fmt_result["log"]:
             st.markdown(f'<div class="log-line">{line}</div>', unsafe_allow_html=True)

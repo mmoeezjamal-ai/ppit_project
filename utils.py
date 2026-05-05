@@ -197,7 +197,7 @@ def analyze_image_quality(pil_img: Image.Image) -> dict:
     is_handwritten = edge_ratio < 0.08
 
     # Multi-column detection (simple): check for wide vertical white stripe in center
-    col_slice  = gray[:, gray.shape[1]//2 - 20: gray.shape[1]//2 + 20]
+    col_slice  = gray_for_analysis[:, gray_for_analysis.shape[1]//2 - 20: gray_for_analysis.shape[1]//2 + 20]
     is_multi_col = float(np.mean(col_slice)) > 200
 
     quality_score = (
@@ -273,6 +273,97 @@ def run_ocr_best(pil_img: Image.Image) -> tuple[dict | None, int, float]:
             best_data = data
             best_psm  = psm
     return best_data, best_psm, best_conf
+
+
+_easyocr_reader = None  # module-level singleton — avoids reloading model each call
+
+
+def run_easyocr(pil_img: Image.Image) -> list | None:
+    """
+    Run EasyOCR on a PIL image.
+    Returns list of (bbox, text, confidence) sorted top→bottom, left→right.
+    Falls back to None if easyocr is not installed.
+    """
+    global _easyocr_reader
+    try:
+        import easyocr
+        if _easyocr_reader is None:
+            _easyocr_reader = easyocr.Reader(["en"], gpu=False, verbose=False)
+        img_np = np.array(pil_img.convert("RGB"))
+        results = _easyocr_reader.readtext(img_np, detail=1, paragraph=False)
+        # Sort top→bottom (y of top-left corner), then left→right
+        results.sort(key=lambda r: (r[0][0][1], r[0][0][0]))
+        return results
+    except ImportError:
+        return None
+    except Exception:
+        return None
+
+
+def easyocr_to_paragraphs(results: list, page_w: int) -> list:
+    """
+    Convert EasyOCR result list → list of paragraph dicts compatible with
+    generate_docx().  Each dict has keys:
+      text, is_heading, heading_level, is_bullet, alignment, is_bold
+    """
+    if not results:
+        return []
+
+    paragraphs = []
+    img_h_approx = max(r[0][2][1] for r in results) if results else 1
+
+    for bbox, text, conf in results:
+        text = text.strip()
+        if not text or conf < 0.15:        # skip very low-confidence detections
+            continue
+
+        tl, tr, br, bl = bbox
+        x_left  = int(tl[0])
+        y_top   = int(tl[1])
+        width   = int(tr[0] - tl[0])
+        height  = int(abs(br[1] - tl[1]))
+
+        # ── Formatting heuristics ──────────────────────────────────────────────
+        # Heading: ALL CAPS, starts with #, or very tall text
+        is_heading = (
+            text.startswith("#") or
+            (text.isupper() and 2 <= len(text.split()) <= 8) or
+            (height > 0 and height > 40)   # large text = heading in notes
+        )
+        clean = re.sub(r"^#+\s*", "", text).strip()
+
+        # Heading level: top 15% of page → H1, otherwise H2
+        heading_level = 1 if (y_top / img_h_approx < 0.15 and is_heading) else 2
+
+        # Bullet detection
+        is_bullet = bool(re.match(
+            r"^([•·●○◦▪▫\-–—\*]|\d{1,2}[.)]\s|[a-zA-Z][.)]\s)", clean
+        ))
+        if is_bullet:
+            clean = re.sub(r"^([•·●○◦▪▫\-–—\*]|\d{1,2}[.)]\s|[a-zA-Z][.)]\s)", "", clean).strip()
+
+        # Alignment (center / right / left)
+        cx = x_left + width / 2
+        if page_w > 0 and abs(cx - page_w / 2) < page_w * 0.12:
+            alignment = "center"
+        elif page_w > 0 and x_left > page_w * 0.5:
+            alignment = "right"
+        else:
+            alignment = "left"
+
+        # Bold: confident heading or very tall characters
+        is_bold = is_heading or (height > 35)
+
+        paragraphs.append({
+            "text":          clean,
+            "is_heading":    is_heading,
+            "heading_level": heading_level,
+            "is_bullet":     is_bullet,
+            "alignment":     alignment,
+            "is_bold":       is_bold,
+        })
+
+    return paragraphs
 
 
 # ══════════════════════════════════════════════════════════════════════════════
