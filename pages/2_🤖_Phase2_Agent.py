@@ -385,7 +385,12 @@ with st.sidebar:
     ocr_engine = "easyocr" if "EasyOCR" in ocr_engine else "tesseract"
 
     if ocr_engine == "easyocr":
-        st.info("EasyOCR runs on the **original image** (no preprocessing needed). First run loads the model (~15 s).")
+        try:
+            import easyocr as _easyocr_test
+            st.info("EasyOCR runs on the **original image** (no preprocessing needed). First run loads the model (~15 s).")
+        except ImportError:
+            st.warning("⚠️ EasyOCR not installed on this server. Run `pip install easyocr` locally for handwriting support. Falling back to Tesseract.")
+            ocr_engine = "tesseract"
 
     override_strategy = st.selectbox(
         "Preprocessing strategy",
